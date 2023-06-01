@@ -73,7 +73,13 @@ class OrtUnet(sd_unet.SdUnet):
 
         ort_inputs = {
             'sample': to_numpy(x), 'timestep': to_numpy(timesteps), 'encoder_hidden_states': to_numpy(context)}
-        ort_outs = torch.Tensor(self.engine.run(None, ort_inputs)[0]).to(devices.device)
+        binding = self.engine.io_binding()
+        binding.bind_output('out_sample')
+        for k, v in ort_inputs.items():
+            binding.bind_cpu_input(k, v)
+
+        self.engine.run_with_iobinding(binding)
+        ort_outs = torch.tensor(binding.copy_outputs_to_cpu()[0], device=x.device)
 
         return self.clip(ort_outs, shape)
 
