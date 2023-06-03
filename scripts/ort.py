@@ -3,6 +3,7 @@ ONNX Runtime UNet
 """
 import os
 import torch
+import psutil
 import numpy as np
 import onnxruntime as ort
 
@@ -25,9 +26,9 @@ class OrtUnet(sd_unet.SdUnet):
     def __init__(self, filename, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.filename = filename
-        self.model = None
-        self.shape = None
-        self.engine = None
+        self.cache = True
+        self.shape = []
+        self.engine = []
 
     @staticmethod
     def clip(tensor, shape):
@@ -47,51 +48,72 @@ class OrtUnet(sd_unet.SdUnet):
             return torch.nn.functional.pad(tensor, (tmp[3], tmp[1] - tmp[3], tmp[2], tmp[0] - tmp[2]), 'reflect')
         return tensor
 
+    def __make_engine(self, x, timesteps, context):
+        def mul(t1, t2):
+            return t1[0] * t2[1] == t1[1] * t2[0]
+
+        shape = x.shape[2:]
+        if shape in self.shape:
+            return self.engine[self.shape.index(shape)]
+        devices.torch_gc()
+        if not self.cache or (devices.device == 'cuda' and get_size(torch.cuda.mem_get_info()[0]) < 4):
+            self.shape.clear()
+            self.engine.clear()
+        elif len(self.shape) > 1:
+            idx = 1 if mul(shape, self.shape[0]) else 0
+            del self.shape[idx]
+            del self.engine[idx]
+
+        options = ort.SessionOptions()
+        options.enable_mem_pattern = False
+        options.enable_cpu_mem_arena = False
+
+        names = dict(zip(
+            ['unet_sample_batch', 'unet_sample_channels', 'unet_sample_height', 'unet_sample_width'], x.shape))
+        names['unet_time_batch'] = timesteps.shape[0]
+        names |= zip(['unet_hidden_batch', 'unet_hidden_sequence'], context.shape[:2])
+        for k, v in names.items():
+            options.add_free_dimension_override_by_name(k, v)
+        self.shape.append(shape)
+        self.engine.append(
+            ort.InferenceSession(self.filename, providers=['DmlExecutionProvider'], sess_options=options))
+        return self.engine[-1]
+
     def forward(self, x, timesteps, context, *args, **kwargs):
         def to_numpy(tensor):
             return tensor.half().cpu().numpy()
 
         shape = x.shape[2:]
         x = self.pad(x)
-        if self.shape is None or self.shape != x.shape[2:]:
-            self.engine = None
-            devices.torch_gc()
-
-        if self.engine is None:
-            options = ort.SessionOptions()
-            options.enable_mem_pattern = False
-
-            names = dict(zip(
-                ['unet_sample_batch', 'unet_sample_channels', 'unet_sample_height', 'unet_sample_width'], x.shape))
-            names['unet_time_batch'] = timesteps.shape[0]
-            names.update(zip(
-                ['unet_hidden_batch', 'unet_hidden_sequence'], context.shape[:2]))
-            for k, v in names.items():
-                options.add_free_dimension_override_by_name(k, v)
-            self.shape = x.shape[2:]
-            self.engine = ort.InferenceSession(self.model, providers=['DmlExecutionProvider'], sess_options=options)
-
+        sess = self.__make_engine(x, timesteps, context)
         ort_inputs = {
             'sample': to_numpy(x), 'timestep': to_numpy(timesteps), 'encoder_hidden_states': to_numpy(context)}
-        binding = self.engine.io_binding()
+        binding = sess.io_binding()
         binding.bind_output('out_sample')
         for k, v in ort_inputs.items():
             binding.bind_cpu_input(k, v)
 
-        self.engine.run_with_iobinding(binding)
+        sess.run_with_iobinding(binding)
+        del ort_inputs
         ort_outs = torch.tensor(binding.copy_outputs_to_cpu()[0], device=x.device)
 
         return self.clip(ort_outs, shape)
 
     def activate(self):
-        print('Loading models ...')
-        self.model = open(self.filename, 'rb').read()
+        cond = [all([devices.device == 'cuda', get_size(torch.cuda.mem_get_info()[1]) < 15]),
+                all([devices.device == 'cpu', get_size(psutil.virtual_memory()[4]) < 10])]
+        if any(cond):
+            self.cache = False
 
     def deactivate(self):
-        self.model = None
-        self.shape = None
-        self.engine = None
+        self.cache = True
+        self.shape = []
+        self.engine = []
         devices.torch_gc()
+
+
+def get_size(ram):
+    return round(ram / 1073741824, 2)
 
 
 def list_unets(model_list):
